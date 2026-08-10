@@ -6,7 +6,7 @@
 | **Project** | mini-fw |
 | **Author** | Design Doc Writer |
 | **Date** | 2026-08-09 |
-| **Status** | Draft (Rev 16 — non-IPv4 always pass to kernel; no drop_non_ipv4) |
+| **Status** | Draft (Rev 18 — consistency: fail-open unbound, CT timeouts, naming) |
 | **Audience** | Senior engineers implementing the dataplane and control plane |
 | **Target OS** | Linux 5.10+ (BTF + libbpf ≥ 0.7 preferred) |
 
@@ -73,7 +73,7 @@ Linux path vs mini-fw attach on a given iface (clsact + XDP). Kernel **TC egress
 
 **Why no XDP CT:** With standard lists as pure blacklist, return traffic is not killed by an empty/miss standard ACL. Stateful allow lives next to extended policy on **TC** only — simpler XDP, smaller verifier surface.
 
-Non-IPv4 (ARP, IPv6, …): **always PASS / OK** — leave to the Linux kernel; no `drop_non_ipv4` knob. IPv4 fragments: **PASS the fragment gate** unless `drop_ipv4_fragments` (default 0). On **TC**, recover L4 ports for non-first fragments via **Cilium-inspired fragment tracking**.
+Non-IPv4 (ARP, IPv6, …): **always PASS / OK** after optional VLAN peel — leave to the Linux kernel. **VLAN/QinQ peel (≤2 tags)** so tagged IPv4 hits the same policy as untagged. IPv4 fragments: optional `drop_ipv4_fragments`; else TC frag tracking.
 
 ---
 
@@ -113,6 +113,7 @@ Greenfield. Empty repository at `/home/ubuntu/mini-fw`. No prior code, maps, or 
 4. `mfw ip access-group` binds list → hook (standard→XDP in / TC out; extended→TC).
 5. **Conntrack: Cilium-inspired BPF CT on TC only** (create/update/lookup). **No CT in XDP** (not needed with blacklist standard ACL).
 6. CLI **`mfw`** + Cisco `ip access-list` syntax; structs **`mfw_*`**; unit tests.
+7. **VLAN / QinQ parsing (peel)** on XDP + both TC hooks: walk outer `ETH_P_8021Q` / `ETH_P_8021AD` tags (up to two) to reach inner ethertype; if inner is IPv4, apply existing L4 policy. No VID-based ACL matching in v1.
 
 ### Non-Goals (v1)
 
@@ -122,7 +123,7 @@ Greenfield. Empty repository at `/home/ubuntu/mini-fw`. No prior code, maps, or 
 - **Full Cilium tree** (no k8s identities, service LB, NodePort, proxy_redirect, DSR, IPv6 CT)
 - **IP reassembly** (no buffering/reordering of fragment payloads — only L4 port recovery via frag map, as Cilium)
 - ICMP error **RELATED** map entries in v1 (Cilium creates related ICMP tuples; we defer — PMTUD may blackhole)
-- VLAN / QinQ parsing (tagged IPv4 is not filtered)
+- **VLAN ID / Cos matching in ACLs** (peel only; policy is still L3/L4, not “match VLAN 10”)
 - Multi-host orchestration, central policy distribution
 - **Router / forward ACL**, and specifically **TC egress as a forward-path policy point** (v1 TC egress = **local-out only**; see path table)
 - Userspace proxying / userspace packet path
@@ -146,7 +147,7 @@ Greenfield. Empty repository at `/home/ubuntu/mini-fw`. No prior code, maps, or 
 | Frag tracking | **Cilium-inspired slim** | See `bpf/lib/ipv4_frag.h` (attributed); TC only; L4 port recovery |
 | `MFW_IPV4_FRAG_MAP_MAX` | **8192** | LRU datagrams in flight (Cilium default scale) |
 | RELATED / ICMP errors | **out of scope v1** | Cilium `TUPLE_F_RELATED` reserved for later |
-| VLAN peel | **none** | `h_proto != ETH_P_IP` → always pass (kernel) |
+| VLAN / QinQ peel | **yes (v1)** | Peel 1–2 tags (`802.1Q` / `802.1AD`); then IPv4 path or pass |
 | IPv4 fragments | **track on TC; optional hard drop** | See `drop_ipv4_fragments` + Cilium frag map rules below |
 | Port “any” sentinel | `(min,max) = (0,0)` | Cannot filter TCP/UDP port 0 in v1 |
 | libbpf minimum | **0.7+** | TC opts + bpf_link; test with distro package on 5.10 |
@@ -168,13 +169,14 @@ Greenfield. Empty repository at `/home/ubuntu/mini-fw`. No prior code, maps, or 
 | K5 | **Standard ACL (1–99) evaluated only in XDP (ingress) and TC egress if bound out** | Source-only matches are ideal for XDP early drop. |
 | K15 | **Extended ACL (100–199) evaluated only in TC (in + out)** | L4 fields + CT + bidirectional policy belong on TC hooks; keeps XDP tiny. |
 | K16 | **Separate maps: `acl_std` (XDP) and `acl_ext` (TC)** | Smaller verifier loops; cannot accidentally run extended ACEs in XDP. |
-| K17 | **Implicit deny: extended lists only (when bound). Standard lists never implicit-deny** | Standard miss = PASS (blacklist). Extended miss = DENY if access-group applied. Unbound hook = open (fail-open). |
+| K17 | **Implicit deny: extended lists only (when bound). Standard lists never implicit-deny** | Standard miss = PASS (blacklist). Extended: userspace materializes trailing synthetic `deny ip any any` on `access-group` (empty lists still deny). Unbound hook (no access-group) = open (fail-open). |
 | K6 | **Cilium tuple model as `mfw_ct_tuple` (not min/max IP key)** | Key = `mfw_ct_tuple` with reversed addrs for forward layout + `flags` (`TUPLE_F_OUT` / `TUPLE_F_IN`). Reply = reverse lookup. |
 | K7 | **LRU_HASH CT map(s); optional split TCP vs any like Cilium** | v1 default: one IPv4 map 64K; optional later `ct4_tcp` + `ct4_any` (Cilium global pattern). |
 | K8 | **No daemon; pin under `/sys/fs/bpf/mfw/`** | `mfw attach` / `mfw detach`; maps survive process exit. Requires bpffs. |
 | K9 | **IPv4 only; no IPv6 dual-path in v1** | Cuts parse surface and map key size; explicit non-goal. |
-| K10 | **Default policy fixed DENY in BPF; `config.default_action` reserved** | Product requirement. CLI `set-default deny` is no-op success; `set-default allow` rejected in v1 (exit 4). Field kept for ABI. `drop_ipv4_fragments` is honored by **XDP and both TC hooks**. Non-IPv4 is never filtered. |
-| K24 | **Non-IPv4 always pass; no `drop_non_ipv4`** | ARP/IPv6/VLAN/etc. are left entirely to the kernel. Filtering them in XDP/TC is unnecessary for an IPv4 L4 mini-fw and breaks L2 (ARP) if mis-set. |
+| K10 | **`config.default_action` reserved (ABI always DENY); not a global “no rules” drop** | CLI `set-default deny` is no-op success; `set-default allow` rejected in v1 (exit 4). Field kept for ABI only — BPF does not branch on it. **IPv4 deny comes from bound extended implicit deny / explicit deny ACEs**, not from “attached with zero access-groups.” Unbound hooks stay fail-open (K17). `drop_ipv4_fragments` is honored by **XDP and both TC hooks**. Non-IPv4 is never filtered. |
+| K24 | **Non-IPv4 always pass; no `drop_non_ipv4`** | ARP/IPv6/LLDP/etc. are left to the kernel. Filtering them in eBPF is unnecessary for an IPv4 L4 mini-fw and breaks L2 (ARP) if mis-set. VLAN-tagged **IPv4** is handled via peel (K25), not “pass as non-IP.” |
+| K25 | **VLAN / QinQ peel in v1 (all three hooks)** | Peel outer 802.1Q / 802.1AD (max two tags) to find `ETH_P_IP`; then same IPv4 ACL/CT path. Closes tagged-IPv4 evasion. No VID match in ACEs. Untagged non-IP still always pass. |
 | K21 | **Do not hard-drop IPv4 fragments on XDP; optional via `drop_ipv4_fragments`** | XDP standard ACL is source-only — fragments still match. Always-drop on XDP kills legitimate large-packet apps before TC. Flag 1 restores early DROP/SHOT on all hooks. |
 | K22 | **Borrow IPv4 fragment tracking from Cilium (slim, attributed)** | Non-first fragments lack L4 headers; without tracking, TC cannot match extended ACL or CT. Cilium’s `ipv4_frag_id` → `ipv4_frag_l4ports` LRU map recovers sport/dport. Types renamed **`mfw_ipv4_frag_id` / `mfw_ipv4_frag_l4ports`**. Map **TC-only** (XDP does not need L4). No payload reassembly. SPDX + Authors of Cilium. |
 | K11 | **Cilium CT status on TC: CT_NEW / CT_ESTABLISHED / CT_REPLY; create after extended allow** | Return path allowed at TC via CT_REPLY without reverse ACE; XDP does not participate. |
@@ -255,13 +257,16 @@ flowchart TB
 ```mermaid
 flowchart TD
   START([Packet at XDP]) --> PARSE{Parse path}
-  PARSE -->|non-IPv4 ethertype| PASS_NON[XDP_PASS — leave to kernel]
-  PARSE -->|corrupt IPv4| DROP_P[outcome XDP_DROP + reason PARSE_ERR]
-  PARSE -->|IPv4 fragment| FRAG{drop_ipv4_fragments?}
-  FRAG -->|1| DROP_F[outcome XDP_DROP + reason PARSE_ERR/frag]
-  FRAG -->|0| STD_F[continue → standard ACL on saddr]
-  PARSE -->|OK IPv4 non-frag| STD{Standard ACL bound?}
-  STD_F --> STD
+  PARSE -->|VLAN/QinQ| PEEL[peel up to 2 tags]
+  PEEL -->|inner IPv4| IP[IPv4 at l3_off]
+  PEEL -->|inner non-IP| PASS_NON[XDP_PASS — leave to kernel]
+  PARSE -->|untagged non-IPv4| PASS_NON
+  PARSE -->|untagged IPv4| IP
+  IP -->|corrupt| DROP_P[XDP_DROP PARSE_ERR]
+  IP -->|fragment| FRAG{drop_ipv4_fragments?}
+  FRAG -->|1| DROP_F[XDP_DROP frag]
+  FRAG -->|0| STD
+  IP -->|OK non-frag| STD{Standard ACL bound?}
   STD -->|no| PASS_S[XDP_PASS → TC]
   STD -->|yes| ACL[Linear acl_std src-only blacklist]
   ACL -->|explicit DENY| D1[DENY_ACL → XDP_DROP]
@@ -282,8 +287,10 @@ flowchart TD
 ```mermaid
 flowchart TD
   START([skb TC egress]) --> PARSE{Parse}
-  PARSE -->|non-IPv4| OK_NON[TC_OUT_OK — leave to kernel]
-  PARSE -->|corrupt IPv4| SHOT_P[outcome TC_OUT_SHOT]
+  PARSE -->|VLAN then non-IP / untagged non-IP| OK_NON[TC_OUT_OK — leave to kernel]
+  PARSE -->|VLAN/QinQ then IPv4 or untagged IPv4| IP[IPv4 path]
+  IP -->|corrupt| SHOT_P[outcome TC_OUT_SHOT]
+  PARSE -->|corrupt IPv4| SHOT_P
   PARSE -->|fragment + drop_ipv4_fragments=1| SHOT_F[outcome TC_OUT_SHOT]
   PARSE -->|has L4 / unfrag| L4[load L4 ports; if first frag → store ipv4_frag]
   PARSE -->|non-first frag| FRAGMAP{ipv4_frag lookup}
@@ -306,15 +313,17 @@ flowchart TD
 
 **CT short-circuit (normative, TC in and out):** Lookup CT **before** any extended ACL. On `CT_ESTABLISHED` / `CT_REPLY` / same-dir `CT_NEW` (refresh path) → **OK immediately** — **do not** re-run extended ACL. Extended (and optional standard on egress) runs **only on CT miss/expired**. There is no “second” extended evaluation per flow once CT exists; fragments of an allowed datagram follow the same rule after port recovery.
 
-**Egress ACL order (when both bound, CT miss only):** Evaluate **extended first** (more specific L4), then **standard** (source); first explicit match wins. v1 recommendation: **one list per direction** (either standard *or* extended out); if both, extended then standard, then implicit deny if either was bound.
+**Egress ACL order (when both bound, CT miss only):** Evaluate **extended first** (more specific L4), then **standard** (source). **First explicit match wins** (permit or deny). If neither list produced an explicit match and **any** list was bound: if **extended** was bound → **SHOT** (implicit deny); if **only standard** was bound → **OK** (blacklist miss). v1 recommendation: **one list per direction** (either standard *or* extended out) to avoid dual-list edge cases.
 
 #### TC ingress
 
 ```mermaid
 flowchart TD
   START([skb TC ingress after XDP_PASS]) --> PARSE{Parse}
-  PARSE -->|non-IPv4| OK_NON[TC_IN_OK — leave to kernel]
-  PARSE -->|corrupt| SHOT_P[TC_IN_SHOT]
+  PARSE -->|VLAN then non-IP / untagged non-IP| OK_NON[TC_IN_OK — leave to kernel]
+  PARSE -->|VLAN/QinQ then IPv4 or untagged IPv4| IP[IPv4 path]
+  IP -->|corrupt| SHOT_P[TC_IN_SHOT]
+  PARSE -->|corrupt| SHOT_P
   PARSE -->|fragment + drop_ipv4_fragments=1| SHOT_F[TC_IN_SHOT]
   PARSE -->|has L4 / unfrag| L4[load L4 ports; if first frag → store ipv4_frag]
   PARSE -->|non-first frag| FRAGMAP{ipv4_frag lookup}
@@ -327,20 +336,18 @@ flowchart TD
   CT -->|NEW reverse of origin| PROMO[promote ESTABLISHED; refresh; OK]
   CT -->|NEW same as origin| REF2[refresh; OK]
   CT -->|miss/expired| EXT{Extended ACL bound?}
-  EXT -->|no| PASS_E[no ext ACL; CT may still miss → policy]
+  EXT -->|no| OPEN[Unbound extended → fail-open]
   EXT -->|yes| ACL[Linear acl_ext L4 match]
   ACL -->|DENY / no match| SHOT_A[SHOT]
   ACL -->|ALLOW| FLAGS{TCP / proto}
+  OPEN --> FLAGS
   FLAGS -->|TCP pure SYN| INS_N[mfw_ct_create4 CT_INGRESS; OK]
   FLAGS -->|TCP non-SYN no CT| SHOT_M[SHOT even if ACL allows]
   FLAGS -->|UDP or ICMP echo only| INS_E[insert ESTABLISHED; OK]
   FLAGS -->|other ICMP no CT| ACL_ONLY[OK without CT insert]
-  PASS_E -->|no CT and no ext allow path| OPEN{Any ACL required?}
-  OPEN -->|no lists bound at all| FAIL_CLOSED[SHOT IPv4 — fail closed if policy expects firewall]
-  OPEN -->|only standard already passed XDP| OK_OPEN[OK without new CT unless flags]
 ```
 
-**Unbound hooks are fail-open** (no access-group → pass that stage). **Standard bound → blacklist only.** **Extended bound → implicit deny.** Optional later: `mfw attach --strict` for fail-closed unbound TC.
+**Unbound hooks are fail-open** (no access-group → pass that stage; optional CT create on SYN/UDP/ICMP echo still applies so one-direction ACLs work). **Standard bound → blacklist only.** **Extended bound → implicit deny.** Optional later: `mfw attach --strict` for fail-closed unbound TC.
 
 **Inbound L4 NEW sessions:** Extended ingress ACL on **TC** → `mfw_ct_create4(..., CT_INGRESS)`. Return SYN-ACK uses reverse-tuple **CT_REPLY** (Cilium), no reverse ACE.
 
@@ -354,10 +361,10 @@ Legend: Cilium **ct_status** from `mfw_ct_lookup4` (SCOPE_BIDIR). TCP flags: S=S
 |-------|----------|-----|-------------------|--------------------------------------|----------------------------|------------------------|
 | any | miss | — | — | std ACL | CT miss → ext ACL | — |
 | any | expired | — | treat as miss; TC deletes | std ACL | CT miss → ext ACL | delete on TC lookup |
-| TCP | NEW | same | any | std ACL | OK + refresh (keep SYN timeout) | update last_seen, pkts, bytes |
-| TCP | NEW | rev | SYN-ACK or ACK | std ACL (miss→PASS typical) | **OK** CT_REPLY | → ESTABLISHED; timeout=TCP_EST; refresh |
+| TCP | NEW | same | any | std ACL | OK + refresh (keep SYN lifetime) | update lifetime, pkts, bytes |
+| TCP | NEW | rev | SYN-ACK or ACK | std ACL (miss→PASS typical) | **OK** CT_REPLY | → ESTABLISHED; lifetime=TCP_EST; refresh |
 | TCP | NEW | rev | other | std ACL | **OK** CT_REPLY | promote ESTABLISHED (handshake-adjacent) |
-| TCP | ESTABLISHED | either | any except policy below | std ACL | OK (no ACL re-run) | refresh; RST → timeout_sec=30 optional |
+| TCP | ESTABLISHED | either | any except policy below | std ACL | OK (no ACL re-run) | refresh; optional RST → short close lifetime |
 | TCP | miss | — | pure SYN | std ACL | ext ACL; if ALLOW → insert NEW | insert BPF_NOEXIST |
 | TCP | miss | — | non-SYN | std ACL | **SHOT** (no orphan mid-flow) | none |
 | UDP | ESTABLISHED | either | — | std ACL | OK | refresh |
@@ -369,7 +376,8 @@ Legend: Cilium **ct_status** from `mfw_ct_lookup4` (SCOPE_BIDIR). TCP flags: S=S
 | IPv4 frag (any) | — | — | MF or offset≠0 **and** `drop_ipv4_fragments=1` | DROP | SHOT | none |
 | IPv4 first frag | — | — | offset=0, has L4, flag=0 | ACL on saddr | load ports → **store** `ipv4_frag`; then **CT first** (hit→OK); ACL only on CT miss | normal CT; frag map update |
 | IPv4 non-first frag | — | — | offset≠0, flag=0 | ACL on saddr (then PASS) | **lookup** `ipv4_frag` → ports; then **CT first** (hit→OK, no ACL re-run); ACL only on CT miss; frag miss → SHOT | CT refresh if hit; no frag map write |
-| non-IPv4 | — | — | ethertype ≠ IPv4 (ARP, IPv6, …) | **always PASS** | **always OK** | none — leave to kernel |
+| non-IPv4 | — | — | ethertype ≠ IPv4 after peel (ARP, IPv6, …) | **always PASS** | **always OK** | none — leave to kernel |
+| VLAN / QinQ + IPv4 | — | — | 1–2 tags then ETH_P_IP | same as untagged IPv4 (peel first) | same as untagged IPv4 | same |
 
 **Open Question #3 resolved:** Inbound (and egress) TCP non-SYN without CT → **SHOT** even if ACL would allow. Forces proper SYN-created state.
 
@@ -654,14 +662,16 @@ This is the **primary product surface**. Flag-style `rule add --src ...` is a th
 
 #### End-of-list semantics (normative)
 
-| List type | Bound? | No ACE matches |
-|-----------|--------|----------------|
+| List type | Bound? | No operator ACE matches |
+|-----------|--------|-------------------------|
 | **Standard (1–99)** | yes | **PASS** (blacklist — **never** implicit deny) |
 | **Standard** | no | PASS (open) |
-| **Extended (100–199)** | yes | **DENY** (classic Cisco implicit deny) |
-| **Extended** | no | PASS / OK (fail-open until configured) |
+| **Extended (100–199)** | yes | **DENY** — userspace materializes a trailing synthetic `deny ip any any` ACE on bind |
+| **Extended** | no | PASS / OK (fail-open until `access-group`) |
 
-Optional later: `mfw attach --strict` = extended-style deny on unbound TC hooks.
+**Bound** means `ip access-group` was applied for that list/direction (materialized into the map), not merely “list exists in CLI history.” Unbound = no ACEs with that direction bit in the map.
+
+Optional later: `mfw attach --strict` = deny IPv4 on TC even with zero access-groups.
 
 #### Interface binding (`ip access-group`)
 
@@ -726,14 +736,20 @@ interface eth0
 2. Reject ports/dst on standard; reject wrong list range for shape.
 3. Convert `host` / `any` / wildcard / CIDR → `mfw_cidr` (BE).
 4. Assign `seq` (explicit or max+10); assign `rule_id`.
-5. On `access-group`, materialize into `acl_std` or `acl_ext` (both `mfw_rule[]`) sorted by `seq`.
-6. Bump `config.generation`.
+5. On `access-group`, materialize into `acl_std` or `acl_ext` (both `mfw_rule[]`) sorted by `seq`, filtered by direction bit.
+6. **Extended only:** append a synthetic final ACE `deny ip any any` (same direction) so classic **implicit deny** is an explicit last rule in the map. Empty extended lists still get this single deny ACE when bound — never fail-open after `access-group`.
+7. **Standard only:** do **not** append implicit deny; empty standard list → no enabled ACEs for that dir → miss → PASS (blacklist).
+8. Bump `config.generation`.
 
 #### BPF: standard match (XDP + optional TC egress)
 
 ```c
-/* Return: 1 = permit (PASS), 0 = deny (DROP), -2 = unbound (PASS).
- * Blacklist: never returns implicit deny; miss → treat as PASS in caller. */
+/* Return: 1 = explicit permit, 0 = explicit deny, -1 = miss (no ACE),
+ *         -2 = unbound (map empty / no enabled ACE).
+ * Blacklist semantics: miss is never implicit deny. Callers map:
+ *   XDP / std-only: (0 → DROP/SHOT; 1|-1|-2 → PASS/OK)
+ *   Dual egress with extended also bound: only 1 counts as ALLOW;
+ *   miss (-1) falls through to extended’s implicit deny. */
 static __always_inline int match_std(__u8 dir_bit, __be32 saddr)
 {
     __u32 k0 = 0;
@@ -751,9 +767,9 @@ static __always_inline int match_std(__u8 dir_bit, __be32 saddr)
             continue;
         if (!cidr_match(saddr, &r->src))
             continue;
-        return r->action == MFW_ACTION_ALLOW ? 1 : 0; /* permit or deny */
+        return r->action == MFW_ACTION_ALLOW ? 1 : 0; /* explicit permit/deny */
     }
-    return 1; /* miss → PASS (blacklist; not implicit deny) */
+    return -1; /* miss — blacklist: not deny; dual-ACL may still SHOT via ext */
 }
 ```
 
@@ -791,11 +807,13 @@ static __always_inline int match_ext(__u8 dir_bit, __u8 proto,
         }
         return r->action == MFW_ACTION_ALLOW ? 1 : 0;
     }
-    return -1;
+    return -1; /* miss — should be rare if userspace appended synthetic deny */
 }
 ```
 
 **XDP must never call `match_ext`.** TC ingress must never call `match_std` (standard ingress is XDP-only).
+
+**Bound vs unbound in BPF:** Prefer direction-bit scan (any enabled ACE with `dir_bit`). For extended, userspace always leaves at least the synthetic deny ACE after `access-group`, so a true miss (-1) is a bug/defense-in-depth → treat as SHOT when any extended ACE existed for that dir. Unbound (-2 / no ACEs with dir) → fail-open.
 
 **PR2 acceptance:** load XDP prog with full 64 std ACEs and TC progs with full 128 ext ACEs on 5.10 + modern kernel.
 
@@ -885,16 +903,28 @@ switch (status):
   CT_NEW (same-dir hit, e.g. retrans SYN still NEW):
       mfw_ct_update_timeout(...); OK   # still no ACL re-run
   CT miss / expired:
-      # First (and only) extended ACL evaluation for this flow
+      # First (and only) ACL evaluation for this flow
+      # Ingress: extended only. Egress: extended then standard (if both bound).
+      allowed = false
+      ext_bound = false
       if extended ACL bound:
-          match_ext(...); deny/implicit deny → SHOT
-      else if egress and standard bound:
-          match_std(...); explicit deny → SHOT
-      # on ALLOW / unbound policy:
-      if TCP and not pure SYN: SHOT (orphan mid-flow)
+          ext_bound = true
+          m = match_ext(...)           # 1 permit, 0 deny, -1 miss, -2 unbound
+          if m == 0: SHOT              # explicit deny
+          if m == 1: allowed = true
+          # m == -1: no explicit match yet
+      if not allowed and egress and standard bound:
+          m = match_std(...)           # 1 permit, 0 deny, -1 miss, -2 unbound
+          if m == 0: SHOT              # explicit deny
+          if m == 1: allowed = true    # explicit permit only
+          # m == -1: blacklist miss — not deny by itself
+      if not allowed and ext_bound:
+          SHOT                         # extended implicit deny
+      # allowed OR (not ext_bound): fail-open or std blacklist miss
+      if TCP and not pure SYN: SHOT    # orphan mid-flow (even if unbound)
       if TCP pure SYN or UDP or ICMP echo:
           mfw_ct_create4(...); OK
-      else: ACL-only / SHOT per proto policy
+      else: ACL-only OK / SHOT per proto policy
 ```
 
 **Egress note:** Reply or data packets for a flow created on ingress (or earlier egress) hit CT on the egress hook and **skip** extended ACL. Do not re-evaluate `acl_ext` “a second time” on TC egress for CT hits.
@@ -903,10 +933,11 @@ switch (status):
 
 ```text
 # No mfw_ct_lookup4 on XDP (Rev 11).
-if match_std(...) == 0:   # explicit deny
+m = match_std(...)
+if m == 0:              # explicit deny only
   XDP_DROP
 else:
-  XDP_PASS              # permit, miss, or unbound → TC does extended + CT
+  XDP_PASS              # 1 permit, -1 miss, -2 unbound → TC does extended + CT
 ```
 
 #### Timeouts (Cilium-like roles)
@@ -950,22 +981,24 @@ stateDiagram-v2
   [*] --> NEW: ACL ALLOW + TCP pure SYN
   [*] --> ESTABLISHED: ACL ALLOW + UDP or ICMP echo
   NEW --> ESTABLISHED: reverse packet observed in TC
-  NEW --> [*]: SYN timeout 30s / LRU
+  NEW --> [*]: SYN timeout CT_SYN_TIMEOUT (60s) / LRU
   ESTABLISHED --> [*]: idle timeout / LRU
 ```
 
-#### Timeouts (lazy expiry)
+#### Timeouts (lazy expiry — absolute `lifetime`)
+
+Normative model matches `struct mfw_ct_entry.lifetime` (Cilium-style absolute mono deadline). **No** separate `last_seen_ns` / `timeout_sec` fields in v1.
 
 ```c
-static __always_inline bool ct_expired(struct mfw_ct_value *v, __u64 now_ns)
+/* bpf_mono_now() = seconds (or same unit as lifetime) from CLOCK_MONOTONIC */
+static __always_inline bool ct_expired(const struct mfw_ct_entry *e, __u32 now)
 {
-    __u64 to_ns = (__u64)v->timeout_sec * 1000000000ull;
-    return now_ns > v->last_seen_ns && (now_ns - v->last_seen_ns) > to_ns;
+    return now > e->lifetime;
 }
 ```
 
 On TC hit + expired: `bpf_map_delete_elem`, `MFW_STAT_CT_EXPIRED_DEL`, treat as miss.  
-On XDP hit + expired: treat as miss (no delete; TC will delete later). LRU also evicts under pressure.
+XDP never looks up CT. LRU also evicts under pressure.
 
 #### Who writes CT?
 
@@ -980,7 +1013,7 @@ On XDP hit + expired: treat as miss (no delete; TC will delete later). LRU also 
 | Scenario | Behavior |
 |----------|----------|
 | SYN flood to ACL-allowed port | Each new SYN tries `BPF_NOEXIST` insert → fills LRU; legitimate ESTABLISHED may evict. **Accepted v1 limitation.** |
-| Mitigation in v1 | Short `MFW_CT_TIMEOUT_TCP_SYN` (30s); LRU; insert-fail stats; no rate limiter (non-goal). |
+| Mitigation in v1 | Short `CT_SYN_TIMEOUT` (**60s**); LRU; insert-fail stats; no rate limiter (non-goal). |
 | XDP | Cannot stop CT fill for traffic that ACL allows (must PASS to TC for insert). |
 | Operator guidance | Do not expose wide allow rules to untrusted nets without external rate limits; educational/lab first. |
 
@@ -988,17 +1021,23 @@ On XDP hit + expired: treat as miss (no delete; TC will delete later). LRU also 
 
 mini-fw is an **IPv4 L4** firewall. Non-IPv4 is **never filtered** — always pass through eBPF and leave policy to the Linux kernel (or other stack components).
 
-#### L2 / non-IPv4 ethertypes (ARP, IPv6, LLDP, …)
+#### L2 ethertypes and VLAN / QinQ
 
-| Ethertype | Examples | mini-fw action (all hooks) |
-|-----------|----------|----------------------------|
-| `ETH_P_ARP` (0x0806) | ARP request/reply | **XDP_PASS / TC_ACT_OK** — kernel ARP |
+| Ethertype / case | Examples | mini-fw action (all hooks) |
+|------------------|----------|----------------------------|
+| `ETH_P_IP` (0x0800) | Untagged IPv4 | IPv4 parse → ACL/CT path |
+| `ETH_P_8021Q` (0x8100) | Single VLAN | **Peel** tag; re-read inner ethertype |
+| `ETH_P_8021AD` (0x88A8) | S-tag (QinQ outer) | **Peel**; allow second Q-tag then inner ethertype |
+| QinQ (two tags) | 0x88A8+0x8100 or 0x8100+0x8100 | Peel **up to two** tags; then same as untagged |
+| Inner after peel = `ETH_P_IP` | Tagged IPv4 | Full IPv4 ACL/CT path (offset past tags) |
+| `ETH_P_ARP` (0x0806) | ARP (tagged or not*) | **PASS / OK** — kernel ARP |
 | `ETH_P_IPV6` | IPv6 | **PASS / OK** — kernel / other tools |
-| `ETH_P_8021Q` | VLAN-tagged frames | **PASS / OK** (no peel in v1; tagged IPv4 not filtered here) |
 | other | LLDP, EAPOL, … | **PASS / OK** |
 
-- **No `drop_non_ipv4` config.** No ARP ACL. Standard/extended lists apply only to `ETH_P_IP`.
-- Rationale: dropping ARP in eBPF is a footgun; IPv6 and other L2 are out of scope for an IPv4 L4 mini-fw.
+\*If ARP is VLAN-tagged, peel first; if inner is ARP → pass. Same for any non-IPv4 after peel.
+
+- **No `drop_non_ipv4` config.** No ARP ACL. No **VID match** in ACEs (peel only).
+- Standard/extended lists apply to **IPv4 payload** after peel (source/L4 as today).
 
 #### IPv4 L4 / next-header
 
@@ -1018,7 +1057,15 @@ mini-fw is an **IPv4 L4** firewall. Non-IPv4 is **never filtered** — always pa
 
 ### Parsing model (BPF) — frozen v1
 
-1. **Ethernet:** If `h_proto != ETH_P_IP` → **always** `XDP_PASS` / `TC_ACT_OK` (leave to kernel). Includes **ARP**, IPv6, VLAN tags, etc. **No VLAN peel.** Tagged IPv4 is not filtered in v1 (limitation / evasion path).
+1. **Ethernet + VLAN / QinQ peel (all hooks):**
+   - Start at Ethernet header; `ethertype = h_proto`, `l3_off = 14`.
+   - While `ethertype` is `ETH_P_8021Q` (0x8100) or `ETH_P_8021AD` (0x88A8) **and** tags peeled &lt; **2**:
+     - Bounds-check 4-byte VLAN header; on OOB → DROP/SHOT (corrupt).
+     - `ethertype = vlan.h_vlan_encapsulated_proto`; `l3_off += 4`; tags++.
+   - If `ethertype == ETH_P_IP` → continue IPv4 path at `l3_off`.
+   - Else (ARP, IPv6, unknown, or &gt;2 tags left as non-IP) → **always** `XDP_PASS` / `TC_ACT_OK` (leave to kernel).
+   - **No VID / PCP matching** in ACLs. Tags are stripped only for ethertype walk + L3 offset.
+   - Triple+ tagged frames: after two peels if still VLAN ethertype → treat as non-IPv4 pass (v1 cap = 2).
 2. **IPv4:** Require `ihl >= 5`. Fragment handling is **not** hard-coded DROP on XDP:
    - Let `is_frag = (frag_off & (IP_MF | IP_OFFSET)) != 0` (same bit test as Cilium: MF or offset ≠ 0).
    - Let `has_l4 = (frag_off & IP_OFFSET) == 0` (offset 0 still has L4 header even if MF=1).
@@ -1029,7 +1076,7 @@ mini-fw is an **IPv4 L4** firewall. Non-IPv4 is **never filtered** — always pa
    - Corrupt / `ihl < 5` → always DROP/SHOT (not configurable).
 3. **L4 (after fragment resolution on TC):**
    - TCP/UDP: ports from headers **or** from `ipv4_frag` lookup.
-   - **ICMP echo** (type 8 request, type 0 reply): set `sport = icmp_id`, `dport = 0`; eligible for CT.
+   - **ICMP echo** (Cilium port placement; eligible for CT): type 8 request → `dport = icmp_id`, `sport = 0`; type 0 reply → `sport = icmp_id`, `dport = 0`.
    - **ICMP error** (type 3, 11, …): no inner-header parse; ACL-only; no CT.
    - **Other ICMP:** ACL on proto only; no CT insert; ports unused.
 
@@ -1113,13 +1160,13 @@ sequenceDiagram
 
 ```c
 SEC("xdp")
-int mini_fw_xdp(struct xdp_md *ctx) { ... }
+int mfw_xdp(struct xdp_md *ctx) { ... }
 
 SEC("tc/ingress")
-int mini_fw_tc_ingress(struct __sk_buff *skb) { ... }
+int mfw_tc_ingress(struct __sk_buff *skb) { ... }
 
 SEC("tc/egress")
-int mini_fw_tc_egress(struct __sk_buff *skb) { ... }
+int mfw_tc_egress(struct __sk_buff *skb) { ... }
 ```
 
 Do **not** use two `SEC("tc")` with the same name. Attach via libbpf TC API (`bpf_tc_hook_create`, `bpf_tc_attach`) selecting programs by section/name.
@@ -1128,7 +1175,7 @@ Do **not** use two `SEC("tc")` with the same name. Attach via libbpf TC API (`bp
 
 ### Multi-interface policy (v1)
 
-- Maps are **global** under the pin root; all attached ifaces share `rules` and `conntrack`.
+- Maps are **global** under the pin root; all attached ifaces share `acl_std`, `acl_ext`, `conntrack`, and `ipv4_frag`.
 - CT key has **no ifindex**; `ifindex` is not stored or matched.
 - **Unsupported:** multi-NIC asymmetric routing where forward and reverse hit different hosts/paths without CT on the reverse iface.
 - **Operator rule:** attach `mfw` on **every** on-path interface for a host firewall, or use a **single** boundary iface. README must warn prominently.
@@ -1143,6 +1190,8 @@ mini-fw/                 # repo name (project)
     mfw.bpf.c
     mfw.h                # shared with include/mfw_uapi.h
     lib/ct.h             # Cilium-derived, mfw_ct_*
+    lib/ct_lookup.h
+    lib/ipv4_frag.h      # Cilium-derived frag port recovery
     vmlinux.h            # optional generated
   src/
     main.c               # builds binary: mfw
@@ -1363,12 +1412,12 @@ Maps persist while pinned and programs attached. Reboot clears all. Optional fut
 |--------|----------|------------|
 | Policy bypass via fragments | Medium | TC recovers L4 via frag map then re-runs ACL+CT; miss → SHOT; optional `drop_ipv4_fragments=1`; no reassembly |
 | Frag map LRU eviction / reorder | Medium | 8K LRU; FRAG_NOT_FOUND SHOT; first-with-L4 still processed if store fails; document |
-| VLAN-tagged IPv4 unfiltered | Medium | Document; no peel in v1; ethertype ≠ IP → always pass |
+| VLAN-tagged IPv4 evasion | Low | **Peel 802.1Q / QinQ (≤2 tags)** then apply IPv4 policy (K25) |
 | Pin directory takeover | High | `/sys/fs/bpf/mfw` mode **0700** root-only |
 | Unprivileged map write | High | Pins root-owned; CAP_BPF required |
 | CT table exhaustion / SYN flood on allowed port | Medium | Short SYN timeout; LRU; insert-fail stats; **no rate limit in v1**; operator docs |
 | Cross-iface CT false allow | Medium | Unsupported multi-NIC asymmetric; shared maps warning |
-| XDP ALLOW then TC race | Low | TC re-checks ACL+CT |
+| XDP PASS then TC race | Low | TC still enforces extended ACL + CT; XDP is std blacklist only |
 | Userspace CLI injected rules | Medium | Only root/capable users; no network-facing API |
 | PMTUD blackhole (no RELATED) | Medium | Document; ICMP errors not associated in v1 |
 | Concurrent rule rewrite torn reads | Low | Document single-writer; best-effort |
@@ -1383,9 +1432,13 @@ Maps persist while pinned and programs attached. Reboot clears all. Optional fut
 - No payload logging.
 - Stats and CT metadata (IPs/ports) visible to root via CLI — treat as sensitive on multi-tenant hosts.
 
-### Default deny
+### Default deny (when policy is bound)
 
-Fail closed on IPv4 ACL miss. Non-IPv4 PASS is intentional; elevate in Overview/README. `set-default allow` is not available in v1.
+- **Extended list bound + ACE miss** → SHOT (classic implicit deny) — fail closed for that hook.
+- **Standard list bound + ACE miss** → PASS (blacklist; never implicit deny).
+- **No access-group on a hook** → fail-open (pass that stage); not “global default deny.”
+- Non-IPv4 PASS is intentional; elevate in Overview/README.
+- `set-default allow` is not available in v1; `config.default_action` is ABI-only (K10).
 
 ---
 
@@ -1397,10 +1450,10 @@ For each packet processed by a program:
 
 1. Increment **exactly one outcome** among:  
    `MFW_STAT_XDP_PASS`, `MFW_STAT_XDP_DROP`, `MFW_STAT_TC_IN_OK`, `MFW_STAT_TC_IN_SHOT`, `MFW_STAT_TC_OUT_OK`, `MFW_STAT_TC_OUT_SHOT`.
-2. Increment **at most one reason** among ACL/CT/parse reason counters (e.g. `MFW_STAT_XDP_CT_ALLOW` + outcome `XDP_PASS`).
+2. Increment **at most one reason** among ACL/CT/parse reason counters (e.g. `MFW_STAT_XDP_DENY_ACL` + outcome `XDP_DROP`, or `MFW_STAT_CT_HIT` + outcome `TC_IN_OK`). **Do not** use reserved `MFW_STAT_XDP_CT_ALLOW` in v1 (XDP has no CT).
 3. CT mutation counters (`INSERT`, `INSERT_FAIL`, `UPDATE`, `PROMOTE`, `EXPIRED_DEL`) increment on those events, independent of the packet outcome pair when applicable.
 
-Flowchart names map 1:1 to enum identifiers (`xdp_ct_allow` → `MFW_STAT_XDP_CT_ALLOW`, etc.).
+Flowchart / reason names map 1:1 to enum identifiers (`xdp_deny_acl` → `MFW_STAT_XDP_DENY_ACL`, `ct_hit` → `MFW_STAT_CT_HIT`, etc.).
 
 ### Logging
 
@@ -1414,7 +1467,8 @@ Out of scope. Operators may scrape `mfw stats --json`.
 
 ```bash
 bpftool prog show
-bpftool map dump pinned /sys/fs/bpf/mfw/maps/rules
+bpftool map dump pinned /sys/fs/bpf/mfw/maps/acl_std
+bpftool map dump pinned /sys/fs/bpf/mfw/maps/acl_ext
 cat /sys/kernel/debug/tracing/trace_pipe   # if DEBUG
 ```
 
@@ -1427,7 +1481,7 @@ cat /sys/kernel/debug/tracing/trace_pipe   # if DEBUG
 | Flag | Default | BPF behavior |
 |------|---------|--------------|
 | `drop_ipv4_fragments` | 0 | **Read by XDP + TC ingress + TC egress**; 1 = early DROP/SHOT all IPv4 fragments |
-| `default_action` | DENY | **Ignored by BPF** (always deny); CLI rejects allow |
+| `default_action` | DENY | **Ignored by BPF** (ABI reserved); CLI rejects allow. Deny comes from bound extended implicit deny, not this field |
 | XDP mode | auto | CLI |
 
 ### Staged enablement (single host)
@@ -1466,7 +1520,7 @@ Helpers compiled with `-DUSERSPACE_TEST` sharing header logic where practical.
 ### BPF load verify — PR2 gate
 
 - `bpftool prog load bpf/mfw.bpf.o /sys/fs/bpf/mf-test` on **5.10** and modern kernel.
-- Empty rules + 128 enabled rules (userspace fill before load not required for verifier; synthetic full loop must verify).
+- Empty `acl_std`/`acl_ext` + full 64 std + 128 ext enabled ACEs (userspace fill before load not required for verifier; synthetic full loop must verify).
 
 ### Smoke tests (`scripts/smoke-test.sh`)
 
@@ -1478,7 +1532,8 @@ Topology:
 
 | # | Scenario | Expect |
 |---|----------|--------|
-| 1 | No rules, ping | Drop (IPv4 default deny) |
+| 1 | Attach only, **no access-group**, ping | **Pass** (unbound fail-open; CT may insert for echo) |
+| 1b | Extended `access-group` with empty list (synthetic deny only), ping | **Drop** (materialized implicit deny) |
 | 2 | Allow ICMP in+out | Ping OK |
 | 3 | Allow TCP:80 **in only** (no egress rule) | Server accepts; reverse SYN-ACK via CT; other ports fail |
 | 4 | Allow **egress only** any from client; **no ingress ACL** | TCP connect + data OK via CT_REPLY then ESTABLISHED |
@@ -1486,13 +1541,16 @@ Topology:
 | 6 | Detach --purge-maps | No BPF; kernel accepts (document) |
 | 7 | Stats: one outcome per packet | Counters coherent |
 | 8 | UDP DNS-like, egress allow only | Return OK via CT |
-| 9 | ICMP echo, allow **out only** (no ingress rule) | Request inserts ESTABLISHED; **reply shares same CT key** → XDP/TC CT hit; ping OK |
+| 9 | ICMP echo, allow **out only** (no ingress rule) | Request inserts ESTABLISHED on TC egress; **reply** hits **TC ingress CT** (same key / reverse); XDP std only (no CT); ping OK |
 | 10a | IPv4 first fragment, `drop_ipv4_fragments=0` | TC stores ports in `ipv4_frag`; L4 ACL + CT as unfragmented |
 | 10b | IPv4 non-first after first, flag=0 | XDP saddr ACL PASS; TC frag lookup hit → same L4 policy/CT as first |
 | 10c | IPv4 non-first **without** prior first (or LRU miss) | TC SHOT + `FRAG_NOT_FOUND` |
 | 10d | IPv4 fragment, `drop_ipv4_fragments=1` | DROP/SHOT on XDP and TC (no frag map use) |
 | 10e | Fragmented UDP large msg, egress allow only | Full datagram path OK via frag track + CT |
 | 11 | Shared maps: rule add changes XDP drop stats and TC path | Hybrid pin reuse |
+| 12 | Single 802.1Q-tagged IPv4, same ACL as untagged | Policy applies after peel |
+| 13 | QinQ (two tags) + IPv4 | Policy applies after double peel |
+| 14 | VLAN-tagged ARP | PASS (kernel); no SHOT |
 
 Use `unshare`, `ip netns`, `socat`/`nc`, `ping`.
 
@@ -1508,14 +1566,14 @@ Use `unshare`, `ip netns`, `socat`/`nc`, `ping`.
 |------|----------|------------|
 | Verifier rejects 128-iter rule loop on 5.10 | High | No unroll; simplify helpers; fallback MAX=64; dual-kernel load in PR2 |
 | Reverse-NEW race: SYN-ACK before insert visible | Medium | Map update before TC returns OK; rare; TCP retransmit recovers |
-| Deterministic handshake drop if CT allow wrong | **Critical if regressed** | Matrix + smoke 3/4/8/9; never ship XDP ESTABLISHED-only |
+| Deterministic handshake drop if CT allow wrong | **Critical if regressed** | Matrix + smoke 3/4/8/9; CT only on TC; never reintroduce XDP CT |
 | Asymmetric multi-homing | Medium | Unsupported; README multi-iface warning |
-| SYN flood CT exhaustion | Medium | 30s SYN timeout; LRU; document operational limits |
+| SYN flood CT exhaustion | Medium | 60s `CT_SYN_TIMEOUT`; LRU; document operational limits |
 | Generic XDP performance | Low | Document native mode |
 | clsact conflict | Medium | Detect; refuse or unique handle |
 | Fragment drop / reorder breaks apps | Medium | Default frag tracking on TC; `drop_ipv4_fragments=1` opt-in; document FRAG_NOT_FOUND + LRU |
 | Frag map exhaustion | Medium | 8K LRU; store-fail still processes L4-bearing piece; miss on later pieces |
-| VLAN evasion | Medium | Document; no peel v1 |
+| VLAN / QinQ peel verifier cost | Low | Fixed max 2 peels; shared helper on XDP+TC |
 | Pin leak mid-attach | Low | Idempotent attach/detach |
 | Torn rule rewrite | Low | Single-writer docs |
 | PMTUD blackhole | Medium | No RELATED; document |
@@ -1524,7 +1582,7 @@ Use `unshare`, `ip netns`, `socat`/`nc`, `ping`.
 
 ## Open Questions
 
-Resolved for v1 (see body): MAX_RULES=128; no VLAN peel; TCP non-SYN without CT → SHOT; shared maps no ifindex; RELATED deferred; default_action BPF-hardcoded deny; libbpf TC API mandatory.
+Resolved for v1 (see body): MAX_RULES=128; **VLAN/QinQ peel (≤2 tags)**; TCP non-SYN without CT → SHOT; shared maps no ifindex; RELATED deferred; default_action BPF-hardcoded deny; libbpf TC API mandatory; non-IPv4 always pass.
 
 **Remaining (non-blocking):**
 
@@ -1625,9 +1683,9 @@ int mfw_xdp(struct xdp_md *ctx)
 
     /* Standard blacklist only — no CT on XDP; frags still match on saddr */
     int m = match_std(MFW_DIR_INGRESS, info.saddr);
-    if (m == 0)   /* explicit deny */
+    if (m == 0)   /* explicit deny only */
         return XDP_DROP;
-    return XDP_PASS;  /* permit, miss (blacklist), or unbound */
+    return XDP_PASS;  /* 1 permit, -1 miss, -2 unbound */
 }
 ```
 
@@ -1652,9 +1710,12 @@ int mfw_tc_ingress(struct __sk_buff *skb)
     /* CT miss only: evaluate extended ACL once, then create if ALLOW */
     int m = match_ext(MFW_DIR_INGRESS, proto, s, d,
                       bpf_ntohs(ports.sport), bpf_ntohs(ports.dport));
-    if (m == -2) { /* unbound extended: OK (fail-open) or policy */ }
-    if (m != 1) return TC_ACT_SHOT;  /* deny or implicit deny */
-    /* ALLOW: insert CT for NEW SYN / UDP / ICMP echo */
+    if (m == -2) {
+        /* unbound extended: fail-open; may still CT-create below */
+    } else if (m != 1) {
+        return TC_ACT_SHOT;  /* explicit deny or implicit deny */
+    }
+    /* ALLOW or unbound: insert CT for NEW SYN / UDP / ICMP echo as applicable */
     return TC_ACT_OK;
 }
 ```
@@ -1684,8 +1745,8 @@ Incremental, each PR independently reviewable and mergeable on main.
 - **Title:** `feat(bpf): XDP standard ACL + TC extended ACL, split maps`
 - **Files/components:** `bpf/mfw.bpf.c`, `bpf/mfw.h`, Makefile BPF target
 - **Dependencies:** PR1
-- **Description:** Maps `acl_std` / `acl_ext`; XDP `match_std` **blacklist** (deny→drop, miss→pass); TC `match_ext` with **implicit deny** when bound; **no CT in XDP**; non-IPv4 always pass; `drop_ipv4_fragments` optional. Frag map may land in PR5c.  
-  **Acceptance:** `bpftool prog load` on 5.10 + modern kernel with full 64 std + 128 ext ACEs.
+- **Description:** Maps `acl_std` / `acl_ext`; XDP `match_std` **blacklist** (deny→drop, miss→pass); TC `match_ext` with **implicit deny** when bound; **no CT in XDP**; non-IPv4 always pass; `drop_ipv4_fragments` optional; **VLAN/QinQ peel (≤2)** before IPv4. Frag map may land in PR5c.  
+  **Acceptance:** `bpftool prog load` on 5.10 + modern kernel with full 64 std + 128 ext ACEs; tagged IPv4 hits same ACL path as untagged.
 
 ### PR3 — Userspace loader: attach/detach, shared pins
 
@@ -1693,7 +1754,7 @@ Incremental, each PR independently reviewable and mergeable on main.
 - **Files/components:** `src/loader.c`, `src/main.c`
 - **Dependencies:** PR2
 - **Description:** Single `bpf_object` load; pin maps once; `SEC("tc/ingress")` / `tc/egress"` via libbpf TC API; XDP link pin; clsact meta; replace semantics; bpffs check.  
-  **Acceptance:** After attach, `bpftool map show` shows one rules map; both programs reference it (hybrid path ready).
+  **Acceptance:** After attach, `bpftool map show` shows pinned `acl_std` + `acl_ext` (and config/stats); XDP and TC programs share the same pin root (hybrid path ready).
 
 ### PR4 — Cisco `ip access-list` CLI (std → XDP, ext → TC)
 
@@ -1738,22 +1799,22 @@ Incremental, each PR independently reviewable and mergeable on main.
 - **Title:** `test: netns smoke-test.sh for ACL and CT one-direction paths`
 - **Files/components:** `scripts/smoke-test.sh`, README CI notes
 - **Dependencies:** PR5b, PR5c, PR6
-- **Description:** Automate cases 1–11 (incl. 10a–e fragment tracking + config); fail CI on regression of reverse path.
+- **Description:** Automate cases 1, 1b, 2–11 (incl. 10a–e fragment tracking + config) and **VLAN/QinQ** cases 12–14; fail CI on regression of reverse path.
 
 ### PR8 — RELATED deferred placeholder + docs polish
 
-- **Title:** `docs: design.md, limitations (RELATED/VLAN/PMTUD), hardening`
+- **Title:** `docs: design.md, limitations (RELATED/PMTUD), hardening`
 - **Files/components:** `docs/design.md`, `README.md`, loader edge cases
 - **Dependencies:** PR7
-- **Description:** Copy design; document non-IPv4 always-pass (kernel), multi-iface, SYN flood, no RELATED (future PR9+); rollback. **No RELATED implementation in this PR.**
+- **Description:** Copy design; document non-IPv4 always-pass (kernel), VLAN peel limits, multi-iface, SYN flood, no RELATED (future PR9+); rollback. **No RELATED implementation in this PR.**
 
 ### Future (post-v1, not scheduled)
 
 - PR-future: ICMP RELATED / PMTUD association  
-- PR-future: VLAN single-tag peel  
+- PR-future: optional VLAN ID match in ACEs  
 - PR-future: raise MAX_RULES toward 256 after measurement  
 - PR-future: optional SYN rate limiting  
 
 ---
 
-*End of design document — mini-fw v1 Draft Rev 16 (non-IPv4 always pass; no drop_non_ipv4) — 2026-08-09*
+*End of design document — mini-fw v1 Draft Rev 18 (consistency pass) — 2026-08-09*
